@@ -507,17 +507,77 @@ async def ws_price_loop(session: aiohttp.ClientSession):
 #  BINANCE REST — Símbolos y klines
 # ══════════════════════════════════════════════════════════
 async def get_usdt_symbols(session: aiohttp.ClientSession) -> list:
-    url = f"{BINANCE_REST}/api/v3/exchangeInfo"
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-        data = await resp.json()
-    symbols = [
-        s["symbol"] for s in data["symbols"]
-        if s["quoteAsset"] == QUOTE_ASSET
-        and s["status"] == "TRADING"
-        and s["isSpotTradingAllowed"]
-    ]
-    log.info(f"Símbolos USDT activos en Binance: {len(symbols)}")
-    return symbols
+    """
+    Obtiene todos los pares USDT activos de Binance Spot.
+    Reintenta hasta 5 veces con espera exponencial ante errores de red,
+    rate limit (429/418) o respuestas inesperadas.
+    """
+    url     = f"{BINANCE_REST}/api/v3/exchangeInfo"
+    # Solo pedimos permisos de permisos de SPOT para reducir payload
+    params  = {"permissions": "SPOT"}
+    max_tries = 5
+
+    for attempt in range(1, max_tries + 1):
+        try:
+            async with session.get(
+                url, params=params, timeout=aiohttp.ClientTimeout(total=45)
+            ) as resp:
+                # Manejar rate-limit de Binance
+                if resp.status in (429, 418):
+                    retry_after = int(resp.headers.get("Retry-After", "10"))
+                    log.warning(
+                        f"get_usdt_symbols: rate limit HTTP {resp.status} "
+                        f"— esperando {retry_after}s (intento {attempt}/{max_tries})"
+                    )
+                    await asyncio.sleep(retry_after)
+                    continue
+
+                if resp.status != 200:
+                    body = await resp.text()
+                    log.error(
+                        f"get_usdt_symbols: HTTP {resp.status} "
+                        f"(intento {attempt}/{max_tries}) — {body[:200]}"
+                    )
+                    await asyncio.sleep(5 * attempt)
+                    continue
+
+                data = await resp.json(content_type=None)   # acepta text/plain también
+
+                # Validar que la respuesta tenga la estructura esperada
+                if not isinstance(data, dict) or "symbols" not in data:
+                    log.error(
+                        f"get_usdt_symbols: respuesta inesperada de Binance "
+                        f"(intento {attempt}/{max_tries}): {str(data)[:300]}"
+                    )
+                    await asyncio.sleep(5 * attempt)
+                    continue
+
+                symbols = [
+                    s["symbol"]
+                    for s in data["symbols"]
+                    if s.get("quoteAsset") == QUOTE_ASSET
+                    and s.get("status") == "TRADING"
+                    and s.get("isSpotTradingAllowed", False)
+                ]
+                log.info(f"Símbolos USDT activos en Binance: {len(symbols)}")
+                return symbols
+
+        except asyncio.TimeoutError:
+            log.warning(
+                f"get_usdt_symbols: timeout (intento {attempt}/{max_tries})"
+            )
+        except Exception as e:
+            log.error(
+                f"get_usdt_symbols: error inesperado (intento {attempt}/{max_tries}): {e}"
+            )
+
+        await asyncio.sleep(5 * attempt)   # espera exponencial entre intentos
+
+    # Si agotamos todos los intentos, abortamos con mensaje claro
+    raise RuntimeError(
+        "get_usdt_symbols: No se pudo obtener la lista de símbolos de Binance "
+        f"tras {max_tries} intentos. Verifica la conectividad de red en Render."
+    )
 
 
 async def get_klines_multi(session: aiohttp.ClientSession, symbol: str) -> list:
@@ -906,12 +966,33 @@ async def bot_loop():
         # Iniciar WebSocket de precios como tarea paralela
         asyncio.create_task(ws_price_loop(session))
 
-        # Obtener lista de símbolos
-        symbols = await get_usdt_symbols(session)
-        bot_status["symbols_monitored"] = len(symbols)
+        # ── Obtener lista de símbolos con reintentos ──────────────
+        symbols            = []
+        SYMBOLS_REFRESH_S  = 6 * 3600   # refrescar lista cada 6 horas
+        last_symbols_fetch = 0.0
 
-        # Bucle principal de escaneo EMA
+        while not symbols:
+            try:
+                symbols = await get_usdt_symbols(session)
+                bot_status["symbols_monitored"] = len(symbols)
+                last_symbols_fetch = time.time()
+            except RuntimeError as e:
+                log.critical(str(e))
+                log.info("Reintentando obtener símbolos en 30s...")
+                await asyncio.sleep(30)
+
+        # ── Bucle principal de escaneo EMA ────────────────────────
         while True:
+            # Refrescar lista de símbolos cada 6 horas
+            if time.time() - last_symbols_fetch > SYMBOLS_REFRESH_S:
+                try:
+                    symbols = await get_usdt_symbols(session)
+                    bot_status["symbols_monitored"] = len(symbols)
+                    last_symbols_fetch = time.time()
+                    log.info("Lista de símbolos actualizada.")
+                except RuntimeError as e:
+                    log.error(f"No se pudo refrescar símbolos: {e} — usando lista anterior.")
+
             t0 = asyncio.get_event_loop().time()
             try:
                 await run_scan(session, symbols)
