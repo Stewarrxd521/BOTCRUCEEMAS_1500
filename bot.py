@@ -435,6 +435,7 @@ async def ws_price_loop(session: aiohttp.ClientSession):
     """
     log.info("WebSocket Price Manager — iniciado")
     last_symbols: frozenset = frozenset()
+    reconnect_delay = 3
 
     while True:
         symbols = frozenset(trade_manager.active_symbols)
@@ -445,6 +446,7 @@ async def ws_price_loop(session: aiohttp.ClientSession):
                 log.info("WS: Sin posiciones activas, cerrando conexión")
             last_symbols = symbols
             await asyncio.sleep(2)
+            reconnect_delay = 3
             continue
 
         # Nueva conexión si los símbolos cambiaron
@@ -463,8 +465,8 @@ async def ws_price_loop(session: aiohttp.ClientSession):
                 heartbeat=20,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as ws:
-
                 last_symbols = symbols
+                reconnect_delay = 3
                 log.info("WS: Conectado correctamente ✅")
 
                 async for msg in ws:
@@ -472,37 +474,38 @@ async def ws_price_loop(session: aiohttp.ClientSession):
                         try:
                             data   = json.loads(msg.data)
                             ticker = data.get("data", {})
-                            sym    = ticker.get("s")
-                            price  = float(ticker.get("c") or 0)
+                            sym    = ticker.get("s")           # símbolo, ej. "BTCUSDT"
+                            price  = float(ticker.get("c") or 0)  # precio de cierre (actual)
 
                             if sym and price > 0:
+                                # 1. Actualizar precio y PnL no realizado
                                 trade_manager.update_price(sym, price)
 
+                                # 2. Verificar si algún trade alcanzó TP o SL
                                 for trade, reason in trade_manager.trades_to_close(sym, price):
                                     closed = await trade_manager.close_trade(trade, price, reason)
                                     if closed:
                                         await send_telegram(session, build_close_message(trade))
 
-                        except Exception as ex:
+                        except (ValueError, KeyError, TypeError) as ex:
                             log.debug(f"WS parse skip: {ex}")
 
-                    elif msg.type == aiohttp.WSMsgType.ERROR:
-                        log.error("WS: error interno")
+                    elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                        log.warning("WS: Conexión cerrada por Binance, reconectando...")
                         break
 
-                    elif msg.type == aiohttp.WSMsgType.CLOSED:
-                        log.warning("WS: cerrado por servidor")
+                    # Reconectar si los símbolos activos cambiaron
+                    new_sym = frozenset(trade_manager.active_symbols)
+                    if new_sym != last_symbols:
+                        log.info("WS: Símbolos activos cambiaron, reconectando...")
                         break
 
-                    # 🔥 Reconexión SOLO si cambian símbolos
-                    if frozenset(trade_manager.active_symbols) != last_symbols:
-                        log.info("WS: símbolos cambiaron → reconectando")
-                        break
-
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             log.error(f"WS error: {e}")
-            await asyncio.sleep(3)  # 🔥 evita reconexión agresiva
-
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30)
 
 
 # ══════════════════════════════════════════════════════════
@@ -695,6 +698,176 @@ async def run_scan(session, symbols):
 # ══════════════════════════════════════════════════════════
 #  DASHBOARD HTML
 # ══════════════════════════════════════════════════════════
+
+
+DASHBOARD_JS = r"""
+<script>
+  const fmtPrice = (v) => Number(v || 0).toLocaleString('en-US', { minimumFractionDigits: 8, maximumFractionDigits: 8 });
+  const fmt4 = (v) => Number(v || 0).toLocaleString('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 });
+  const fmt2 = (v) => Number(v || 0).toFixed(2);
+
+  function openRowsHTML(trades) {
+    if (!trades || !trades.length) {
+      return '<tr><td colspan="11" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones abiertas</td></tr>';
+    }
+    return trades.map(t => {
+      const dirColor = t.direction === 'LONG' ? '#3fb950' : '#f85149';
+      const pnlColor = Number(t.pnl_usdt) >= 0 ? '#3fb950' : '#f85149';
+      const current = Number(t.current_price || 0);
+      const tp = Number(t.tp_price || 0);
+      const sl = Number(t.sl_price || 0);
+      const distTp = current ? Math.abs(tp - current) / current * 100 : 0;
+      const distSl = current ? Math.abs(sl - current) / current * 100 : 0;
+      return `
+        <tr>
+          <td>#${t.id}</td>
+          <td><b>${t.symbol}</b></td>
+          <td style="color:${dirColor}">${t.direction === 'LONG' ? '🟢 LONG' : '🔴 SHORT'}</td>
+          <td>$${fmtPrice(t.entry_price)}</td>
+          <td><b>$${fmtPrice(current)}</b></td>
+          <td style="color:#3fb950">$${fmtPrice(tp)} <small>(${distTp.toFixed(2)}%)</small></td>
+          <td style="color:#f85149">$${fmtPrice(sl)} <small>(${distSl.toFixed(2)}%)</small></td>
+          <td style="color:${pnlColor};font-weight:bold">${Number(t.pnl_usdt || 0) >= 0 ? '+' : ''}${fmt4(t.pnl_usdt)}</td>
+          <td style="color:${pnlColor};font-weight:bold">${Number(t.roi_pct || 0) >= 0 ? '+' : ''}${fmt2(t.roi_pct)}%</td>
+          <td>${fmt2(t.usdt_size)}</td>
+          <td style="font-size:.72rem">${t.open_time || ''}</td>
+        </tr>`;
+    }).join('');
+  }
+
+  function alertRowsHTML(alerts) {
+    if (!alerts || !alerts.length) {
+      return '<tr><td colspan="5" style="color:#8b949e;text-align:center;padding:.8rem">Sin señales aún...</td></tr>';
+    }
+    return alerts.map(a => {
+      const color = a.signal === 'LONG' ? '#3fb950' : '#f85149';
+      return `
+        <tr style="color:${color}">
+          <td>${a.time || ''}</td>
+          <td><b>${a.symbol || ''}</b></td>
+          <td>${a.signal === 'LONG' ? '🟢 LONG' : '🔴 SHORT'}</td>
+          <td>$${a.price || ''}</td>
+          <td>${Number(a.spread || 0).toFixed(2)}%</td>
+        </tr>`;
+    }).join('');
+  }
+
+  function closedRowsHTML(trades) {
+    if (!trades || !trades.length) {
+      return '<tr><td colspan="10" style="color:#8b949e;text-align:center;padding:.8rem">Sin operaciones cerradas aún</td></tr>';
+    }
+    return trades.map(t => {
+      const pnlColor = Number(t.pnl_usdt) >= 0 ? '#3fb950' : '#f85149';
+      const reason = t.status === 'TP' ? '✅ TP' : '❌ SL';
+      return `
+        <tr style="color:${pnlColor}">
+          <td>#${t.id}</td>
+          <td><b>${t.symbol}</b></td>
+          <td>${t.direction === 'LONG' ? '🟢' : '🔴'} ${t.direction}</td>
+          <td>$${fmtPrice(t.entry_price)}</td>
+          <td>$${fmtPrice(t.close_price)}</td>
+          <td><b>${Number(t.pnl_usdt || 0) >= 0 ? '+' : ''}${fmt4(t.pnl_usdt)}</b></td>
+          <td><b>${Number(t.roi_pct || 0) >= 0 ? '+' : ''}${fmt2(t.roi_pct)}%</b></td>
+          <td>${fmt2(t.usdt_size)}</td>
+          <td>${reason}</td>
+          <td style="font-size:.72rem">${t.close_time || ''}</td>
+        </tr>`;
+    }).join('');
+  }
+
+  async function refreshDashboard() {
+    try {
+      const res = await fetch('/api/state', { cache: 'no-store' });
+      if (!res.ok) return;
+      const d = await res.json();
+
+      document.getElementById('balance_value').textContent = fmt2(d.balance) + ' USDT';
+      document.getElementById('equity_value').textContent = fmt2(d.equity) + ' USDT';
+      document.getElementById('rpnl_value').textContent = (Number(d.realized_pnl) >= 0 ? '+' : '') + fmt4(d.realized_pnl) + ' USDT';
+      document.getElementById('upnl_value').textContent = (Number(d.unrealized_pnl) >= 0 ? '+' : '') + fmt4(d.unrealized_pnl) + ' USDT';
+      document.getElementById('wr_value').textContent = d.win_rate === null ? 'N/A' : `${d.win_rate.toFixed(1)}% (${d.wins}✅ / ${d.losses}❌)`;
+      document.getElementById('open_count_value').textContent = `${d.open_trades.length} / ${d.settings.max_longs + d.settings.max_shorts}`;
+      document.getElementById('long_count_value').textContent = `${d.open_longs}L`;
+      document.getElementById('short_count_value').textContent = `${d.open_shorts}S`;
+      document.getElementById('alerts_value').textContent = d.total_alerts;
+      document.getElementById('last_scan_value').textContent = d.last_scan || '';
+      document.getElementById('ws_symbols_value').textContent = 'WS activo en: ' + (d.active_symbols.length ? d.active_symbols.join(', ') : 'Ninguno');
+
+      document.getElementById('open_trades_body').innerHTML = openRowsHTML(d.open_trades);
+      document.getElementById('alerts_body').innerHTML = alertRowsHTML(d.alerts);
+      document.getElementById('closed_trades_body').innerHTML = closedRowsHTML(d.closed_trades);
+    } catch (e) {
+      console.error('Dashboard refresh failed', e);
+    }
+  }
+
+  refreshDashboard();
+  setInterval(refreshDashboard, 1000);
+</script>
+"""
+
+
+def get_dashboard_state() -> dict:
+    tm = trade_manager
+
+    def serialize_trade(t: Trade) -> dict:
+        return {
+            "id": t.id,
+            "symbol": t.symbol,
+            "direction": t.direction,
+            "entry_price": t.entry_price,
+            "quantity": t.quantity,
+            "usdt_size": t.usdt_size,
+            "open_time": t.open_time,
+            "tp_price": t.tp_price,
+            "sl_price": t.sl_price,
+            "current_price": t.current_price,
+            "status": t.status,
+            "close_price": t.close_price,
+            "close_time": t.close_time,
+            "pnl_usdt": t.pnl_usdt,
+            "roi_pct": t.roi_pct,
+        }
+
+    closed_all = tm.closed_trades
+    wins = sum(1 for t in closed_all if t.status == "TP")
+    losses = sum(1 for t in closed_all if t.status == "SL")
+    total_cl = len(closed_all)
+
+    return {
+        "balance": tm.balance,
+        "equity": tm.equity,
+        "realized_pnl": tm.total_realized_pnl,
+        "unrealized_pnl": tm.unrealized_pnl,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": (wins / total_cl * 100.0) if total_cl else None,
+        "total_alerts": bot_status["total_alerts"],
+        "last_scan": bot_status["last_scan"],
+        "symbols_monitored": bot_status["symbols_monitored"],
+        "active_symbols": sorted(tm.active_symbols),
+        "open_longs": len(tm.open_longs),
+        "open_shorts": len(tm.open_shorts),
+        "open_trades": [serialize_trade(t) for t in sorted(tm.open_trades, key=lambda x: x.id)],
+        "closed_trades": [serialize_trade(t) for t in list(reversed(closed_all))[:20]],
+        "alerts": list(reversed(bot_status["last_alerts"])),
+        "settings": {
+            "ema_fast": EMA_FAST,
+            "ema_mid": EMA_MID,
+            "ema_slow": EMA_SLOW,
+            "spread_pct": SPREAD_PCT,
+            "days_back": DAYS_BACK,
+            "tp_pct": TP_PCT,
+            "sl_pct": SL_PCT,
+            "max_longs": MAX_LONGS,
+            "max_shorts": MAX_SHORTS,
+        },
+    }
+
+
+async def api_state_handler(request):
+    return web.json_response(get_dashboard_state())
+
 def build_dashboard() -> str:
     tm = trade_manager
 
@@ -771,7 +944,7 @@ def build_dashboard() -> str:
 <html lang="es">
 <head>
   <meta charset="utf-8">
-  <meta http-equiv="refresh" content="10">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>EMA Strategy Bot — Paper Trading</title>
   <style>
     *{{box-sizing:border-box;margin:0;padding:0}}
@@ -800,42 +973,42 @@ def build_dashboard() -> str:
   <div class="grid">
     <div class="card">
       <div class="label">Balance libre</div>
-      <div class="value ok">{tm.balance:.2f} USDT</div>
+      <div class="value ok" id="balance_value">{tm.balance:.2f} USDT</div>
     </div>
     <div class="card">
       <div class="label">Equity total</div>
-      <div class="value" style="color:{eq_color}">{equity:.2f} USDT</div>
+      <div class="value" style="color:{eq_color}" id="equity_value">{equity:.2f} USDT</div>
     </div>
     <div class="card">
       <div class="label">PnL realizado</div>
-      <div class="value" style="color:{rpnl_color}">{rpnl:+.4f} USDT</div>
+      <div class="value" style="color:{rpnl_color}" id="rpnl_value">{rpnl:+.4f} USDT</div>
     </div>
     <div class="card">
       <div class="label">PnL no realizado</div>
-      <div class="value" style="color:{upnl_color}">{upnl:+.4f} USDT</div>
+      <div class="value" style="color:{upnl_color}" id="upnl_value">{upnl:+.4f} USDT</div>
     </div>
     <div class="card">
       <div class="label">Win Rate</div>
-      <div class="value warn">{wr_str} ({wins}✅ / {losses}❌)</div>
+      <div class="value warn" id="wr_value">{wr_str} ({wins}✅ / {losses}❌)</div>
     </div>
     <div class="card">
       <div class="label">Posiciones abiertas</div>
-      <div class="value">{len(tm.open_trades)} / {MAX_LONGS + MAX_SHORTS}</div>
+      <div class="value" id="open_count_value">{len(tm.open_trades)} / {MAX_LONGS + MAX_SHORTS}</div>
     </div>
     <div class="card">
       <div class="label">LONG / SHORT activos</div>
       <div class="value">
-        <span class="ok">{len(tm.open_longs)}L</span> /
-        <span class="err">{len(tm.open_shorts)}S</span>
+        <span class="ok" id="long_count_value">{len(tm.open_longs)}L</span> /
+        <span class="err" id="short_count_value">{len(tm.open_shorts)}S</span>
       </div>
     </div>
     <div class="card">
       <div class="label">Balance inicial</div>
-      <div class="value">{INITIAL_BALANCE:.2f} USDT</div>
+      <div class="value" id="initial_balance_value">{INITIAL_BALANCE:.2f} USDT</div>
     </div>
     <div class="card">
       <div class="label">Por operación</div>
-      <div class="value warn">{USDT_PER_TRADE:.2f} USDT</div>
+      <div class="value warn" id="trade_size_value">{USDT_PER_TRADE:.2f} USDT</div>
     </div>
     <div class="card">
       <div class="label">TP / SL</div>
@@ -846,11 +1019,11 @@ def build_dashboard() -> str:
     </div>
     <div class="card">
       <div class="label">Señales EMA</div>
-      <div class="value warn">{bot_status['total_alerts']}</div>
+      <div class="value warn" id="alerts_value">{bot_status['total_alerts']}</div>
     </div>
     <div class="card">
       <div class="label">Último escaneo</div>
-      <div class="value" style="font-size:.75rem">{bot_status['last_scan']}</div>
+      <div class="value" style="font-size:.75rem" id="last_scan_value">{bot_status['last_scan']}</div>
     </div>
   </div>
 
@@ -859,7 +1032,7 @@ def build_dashboard() -> str:
     <span class="ws-indicator"></span>
     📊 Posiciones Abiertas — precios en tiempo real (WebSocket Binance)
   </h2>
-  <p style="color:#484f58;font-size:.72rem;margin-bottom:.4rem">
+  <p id="ws_symbols_value" style="color:#484f58;font-size:.72rem;margin-bottom:.4rem">
     WS activo en: {ws_syms}
   </p>
   <div class="wrap">
@@ -873,7 +1046,7 @@ def build_dashboard() -> str:
           <th>Tamaño</th><th>Abierto</th>
         </tr>
       </thead>
-      <tbody>
+      <tbody id="open_trades_body">
         {open_rows if open_rows else
           '<tr><td colspan="11" style="color:#8b949e;text-align:center;padding:.8rem">Sin posiciones abiertas</td></tr>'}
       </tbody>
@@ -887,7 +1060,7 @@ def build_dashboard() -> str:
       <thead>
         <tr><th>Hora UTC</th><th>Par</th><th>Señal</th><th>Precio</th><th>Spread</th></tr>
       </thead>
-      <tbody>
+      <tbody id="alerts_body">
         {alerts_html if alerts_html else
           '<tr><td colspan="5" style="color:#8b949e;text-align:center;padding:.8rem">Sin señales aún...</td></tr>'}
       </tbody>
@@ -906,7 +1079,7 @@ def build_dashboard() -> str:
           <th>Tamaño</th><th>Resultado</th><th>Cerrado</th>
         </tr>
       </thead>
-      <tbody>
+      <tbody id="closed_trades_body">
         {closed_rows if closed_rows else
           '<tr><td colspan="10" style="color:#8b949e;text-align:center;padding:.8rem">Sin operaciones cerradas aún</td></tr>'}
       </tbody>
@@ -916,8 +1089,10 @@ def build_dashboard() -> str:
   <p style="color:#484f58;margin-top:.6rem;font-size:.7rem">
     Estrategia: EMA{EMA_FAST}/{EMA_MID}/{EMA_SLOW} | Spread ≥{SPREAD_PCT}% |
     Timeframe: 1m | Datos: {DAYS_BACK}d | Binance USDT Spot |
-    Refresca cada 10s | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
+    Última actualización local: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
   </p>
+
+  {DASHBOARD_JS}
 </body>
 </html>"""
 
@@ -930,6 +1105,7 @@ async def start_http_server():
     app = web.Application()
     app.router.add_get("/", health_handler)
     app.router.add_get("/health", health_handler)
+    app.router.add_get("/api/state", api_state_handler)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -1034,4 +1210,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
