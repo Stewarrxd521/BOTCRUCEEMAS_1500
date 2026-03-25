@@ -31,8 +31,8 @@ from typing import Optional
 # ══════════════════════════════════════════════════════════
 #  CONFIGURACIÓN  (variables de entorno en Render/Railway)
 # ══════════════════════════════════════════════════════════
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8700613197:AAFu7KAP3_9joN8Jq76r3ZcKIZiGcUWzSc4")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID",   "1474510598")
+TELEGRAM_BOT_TOKEN = "8700613197:AAFu7KAP3_9joN8Jq76r3ZcKIZiGcUWzSc4"
+TELEGRAM_CHAT_ID   = "1474510598"
 
 # ── EMAs ───────────────────────────────────────────────────
 EMA_FAST   = int(os.environ.get("EMA_FAST",   "35"))
@@ -461,46 +461,48 @@ async def ws_price_loop(session: aiohttp.ClientSession):
             async with session.ws_connect(
                 url,
                 heartbeat=20,
-                timeout=aiohttp.ClientWSTimeout(ws_close_timeout=15),
+                timeout=aiohttp.ClientTimeout(total=30),
             ) as ws:
+
                 last_symbols = symbols
+                log.info("WS: Conectado correctamente ✅")
 
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         try:
                             data   = json.loads(msg.data)
                             ticker = data.get("data", {})
-                            sym    = ticker.get("s")           # símbolo, ej. "BTCUSDT"
-                            price  = float(ticker.get("c") or 0)  # precio de cierre (actual)
+                            sym    = ticker.get("s")
+                            price  = float(ticker.get("c") or 0)
 
                             if sym and price > 0:
-                                # 1. Actualizar precio y PnL no realizado
                                 trade_manager.update_price(sym, price)
 
-                                # 2. Verificar si algún trade alcanzó TP o SL
                                 for trade, reason in trade_manager.trades_to_close(sym, price):
                                     closed = await trade_manager.close_trade(trade, price, reason)
                                     if closed:
                                         await send_telegram(session, build_close_message(trade))
 
-                        except (ValueError, KeyError, TypeError) as ex:
+                        except Exception as ex:
                             log.debug(f"WS parse skip: {ex}")
 
-                    elif msg.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
-                        log.warning("WS: Conexión cerrada por Binance, reconectando...")
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        log.error("WS: error interno")
                         break
 
-                    # Reconectar si los símbolos activos cambiaron
-                    new_sym = frozenset(trade_manager.active_symbols)
-                    if new_sym != last_symbols:
-                        log.info("WS: Símbolos activos cambiaron, reconectando...")
+                    elif msg.type == aiohttp.WSMsgType.CLOSED:
+                        log.warning("WS: cerrado por servidor")
                         break
 
-        except asyncio.CancelledError:
-            raise
+                    # 🔥 Reconexión SOLO si cambian símbolos
+                    if frozenset(trade_manager.active_symbols) != last_symbols:
+                        log.info("WS: símbolos cambiaron → reconectando")
+                        break
+
         except Exception as e:
             log.error(f"WS error: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(3)  # 🔥 evita reconexión agresiva
+
 
 
 # ══════════════════════════════════════════════════════════
@@ -1032,3 +1034,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
