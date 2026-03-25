@@ -52,7 +52,7 @@ USDT_PER_TRADE  = max(float(os.environ.get("USDT_PER_TRADE", "50.0")), 5.1)
 MAX_LONGS       = int(os.environ.get("MAX_LONGS",  "10"))   # máx posiciones LONG
 MAX_SHORTS      = int(os.environ.get("MAX_SHORTS", "10"))   # máx posiciones SHORT
 TP_PCT          = float(os.environ.get("TP_PCT", "1.0"))    # Take Profit: +1% ROI
-SL_PCT          = float(os.environ.get("SL_PCT", "5.0"))    # Stop Loss:   -5% ROI
+SL_PCT          = float(os.environ.get("SL_PCT", "2.0"))    # Stop Loss:   -2% ROI
 
 # ── Binance ────────────────────────────────────────────────
 QUOTE_ASSET   = "USDT"
