@@ -34,6 +34,9 @@ from typing import Optional
 TELEGRAM_BOT_TOKEN = "8700613197:AAFu7KAP3_9joN8Jq76r3ZcKIZiGcUWzSc4"
 TELEGRAM_CHAT_ID   = "1474510598"
 
+EXECUTOR_URL    = os.environ.get("EXECUTOR_URL",    "https://executor-5lu0.onrender.com")
+EXECUTOR_SECRET = os.environ.get("EXECUTOR_SECRET", "clave-secreta-aleatoria")
+
 # ── EMAs ───────────────────────────────────────────────────
 EMA_FAST   = int(os.environ.get("EMA_FAST",   "35"))
 EMA_MID    = int(os.environ.get("EMA_MID",    "300"))
@@ -338,6 +341,17 @@ async def send_telegram(session: aiohttp.ClientSession, message: str):
     except Exception as e:
         log.error(f"Error Telegram: {e}")
 
+async def notify_executor(session, payload):
+    if not EXECUTOR_URL: return
+    url = EXECUTOR_URL.rstrip("/") + "/signal"
+    try:
+        async with session.post(url, json=payload,
+            headers={"X-Signal-Secret": EXECUTOR_SECRET},
+            timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            log.debug(f"Executor: {resp.status}")
+    except Exception as e:
+        log.warning(f"notify_executor: {e}")
+
 
 def build_open_message(trade: Trade, ema_result: dict, change_1m: float) -> str:
     """Mensaje Telegram al abrir una posición."""
@@ -485,6 +499,11 @@ async def ws_price_loop(session: aiohttp.ClientSession):
                                 for trade, reason in trade_manager.trades_to_close(sym, price):
                                     closed = await trade_manager.close_trade(trade, price, reason)
                                     if closed:
+                                        asyncio.create_task(notify_executor(session, {
+    "action": "close", "trade_id": trade.id,
+    "symbol": trade.symbol, "direction": trade.direction,
+    "reason": trade.status, "close_price": trade.close_price,
+}))
                                         await send_telegram(session, build_close_message(trade))
 
                         except (ValueError, KeyError, TypeError) as ex:
@@ -679,6 +698,12 @@ async def run_scan(session, symbols):
         trade = await trade_manager.open_trade(symbol, result["signal"], price)
 
         if trade:
+
+            asyncio.create_task(notify_executor(session, {
+    "action": "open", "trade_id": trade.id,
+    "symbol": trade.symbol, "direction": trade.direction,
+    "price": trade.entry_price,
+}))         
             msg = build_open_message(trade, result, change_1m)
             log.info(
                 f"  → {result['signal']} {symbol} | spread {result['spread']:.2f}% "
@@ -690,6 +715,9 @@ async def run_scan(session, symbols):
                 f"  → {result['signal']} {symbol} | spread {result['spread']:.2f}% "
                 f"| Sin trade (límite o balance)"
             )
+
+
+      
 
         await send_telegram(session, msg)
         await asyncio.sleep(0.3)
