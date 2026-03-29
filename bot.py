@@ -52,9 +52,9 @@ DAYS_BACK  = int(os.environ.get("DAYS_BACK", "2"))
 INITIAL_BALANCE = float(os.environ.get("INITIAL_BALANCE", "3000.0"))
 # Tamaño por operación — Binance Spot exige mínimo 5 USDT (usamos 5.1 por margen)
 USDT_PER_TRADE  = max(float(os.environ.get("USDT_PER_TRADE", "50.0")), 5.1)
-MAX_LONGS       = int(os.environ.get("MAX_LONGS",  "30"))   # máx posiciones LONG
-MAX_SHORTS      = int(os.environ.get("MAX_SHORTS", "30"))   # máx posiciones SHORT
-TP_PCT          = float(os.environ.get("TP_PCT", "0.90"))    # Take Profit: +1% ROI
+MAX_LONGS       = int(os.environ.get("MAX_LONGS",  "10"))   # máx posiciones LONG
+MAX_SHORTS      = int(os.environ.get("MAX_SHORTS", "10"))   # máx posiciones SHORT
+TP_PCT          = float(os.environ.get("TP_PCT", "1.0"))    # Take Profit: +1% ROI
 SL_PCT          = float(os.environ.get("SL_PCT", "1.9"))    # Stop Loss:   -2% ROI
 
 # ── Binance ────────────────────────────────────────────────
