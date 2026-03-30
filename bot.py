@@ -1,6 +1,6 @@
 """
-EMA Strategy Bot — Binance USDT → Telegram + Paper Trading Simulator
-══════════════════════════════════════════════════════════════════════
+EMA Strategy Bot — Binance USDT Futures → Telegram + Paper Trading Simulator
+══════════════════════════════════════════════════════════════════════════════
 Estrategia:
   • EMAs: 35, 300, 1500 (2 días de velas de 1 minuto)
   • LONG : EMA35 y EMA300 < EMA1500  +  spread EMA1500-EMA300 >= X%
@@ -9,11 +9,11 @@ Estrategia:
            Y EMA35 cruza HACIA ABAJO  la EMA300
 
 PAPER TRADING (simulación):
-  • Balance virtual configurable (default 1000 USDT)
+  • Balance virtual configurable (default 3000 USDT)
   • Máximo 10 LONG + 10 SHORT simultáneos
-  • Tamaño mínimo por operación: 5 USDT (estándar Binance Spot)
-  • TP: +1% ROI | SL: -5% ROI por operación
-  • Precio en tiempo real vía WebSocket de Binance (miniTicker)
+  • Opera únicamente pares USDT Perpetual de Binance Futures (fapi)
+  • TP: +4% ROI | SL: -1% ROI por operación  →  RR 1:4
+  • Precio en tiempo real vía WebSocket de Binance Futures (miniTicker)
   • Reconexión automática al cambiar el conjunto de símbolos activos
   • Dashboard HTML con posiciones abiertas/cerradas y estadísticas
 """
@@ -50,17 +50,17 @@ DAYS_BACK  = int(os.environ.get("DAYS_BACK", "2"))
 
 # ── Paper Trading ──────────────────────────────────────────
 INITIAL_BALANCE = float(os.environ.get("INITIAL_BALANCE", "3000.0"))
-# Tamaño por operación — Binance Spot exige mínimo 5 USDT (usamos 5.1 por margen)
-USDT_PER_TRADE  = max(float(os.environ.get("USDT_PER_TRADE", "50.0")), 5.1)
+# Tamaño por operación (Futures no tiene el mínimo fijo de Spot)
+USDT_PER_TRADE  = float(os.environ.get("USDT_PER_TRADE", "50.0"))
 MAX_LONGS       = int(os.environ.get("MAX_LONGS",  "10"))   # máx posiciones LONG
 MAX_SHORTS      = int(os.environ.get("MAX_SHORTS", "10"))   # máx posiciones SHORT
-TP_PCT          = float(os.environ.get("TP_PCT", "1.0"))    # Take Profit: +1% ROI
-SL_PCT          = float(os.environ.get("SL_PCT", "1.9"))    # Stop Loss:   -2% ROI
+TP_PCT          = float(os.environ.get("TP_PCT", "4.0"))    # Take Profit: +4% ROI  → RR 1:4
+SL_PCT          = float(os.environ.get("SL_PCT", "1.0"))    # Stop Loss:   -1% ROI  → RR 1:4
 
-# ── Binance ────────────────────────────────────────────────
+# ── Binance Futures ────────────────────────────────────────
 QUOTE_ASSET   = "USDT"
-BINANCE_REST  = "https://api.binance.com"
-BINANCE_WS    = "wss://stream.binance.com:9443"
+BINANCE_REST  = "https://fapi.binance.com"      # Futures REST API (USDT-M Perpetual)
+BINANCE_WS    = "wss://fstream.binance.com"     # Futures WebSocket
 INTERVAL      = "1m"
 LIMIT_PER_REQ = 1000   # máximo de Binance por petición de klines
 
@@ -532,19 +532,17 @@ async def ws_price_loop(session: aiohttp.ClientSession):
 # ══════════════════════════════════════════════════════════
 async def get_usdt_symbols(session: aiohttp.ClientSession) -> list:
     """
-    Obtiene todos los pares USDT activos de Binance Spot.
+    Obtiene todos los pares USDT Perpetual activos de Binance Futures.
     Reintenta hasta 5 veces con espera exponencial ante errores de red,
     rate limit (429/418) o respuestas inesperadas.
     """
-    url     = f"{BINANCE_REST}/api/v3/exchangeInfo"
-    # Solo pedimos permisos de permisos de SPOT para reducir payload
-    params  = {"permissions": "SPOT"}
+    url     = f"{BINANCE_REST}/fapi/v1/exchangeInfo"  # Futures endpoint
     max_tries = 5
 
     for attempt in range(1, max_tries + 1):
         try:
             async with session.get(
-                url, params=params, timeout=aiohttp.ClientTimeout(total=45)
+                url, timeout=aiohttp.ClientTimeout(total=45)
             ) as resp:
                 # Manejar rate-limit de Binance
                 if resp.status in (429, 418):
@@ -565,25 +563,25 @@ async def get_usdt_symbols(session: aiohttp.ClientSession) -> list:
                     await asyncio.sleep(5 * attempt)
                     continue
 
-                data = await resp.json(content_type=None)   # acepta text/plain también
+                data = await resp.json(content_type=None)
 
-                # Validar que la respuesta tenga la estructura esperada
                 if not isinstance(data, dict) or "symbols" not in data:
                     log.error(
-                        f"get_usdt_symbols: respuesta inesperada de Binance "
+                        f"get_usdt_symbols: respuesta inesperada de Binance Futures "
                         f"(intento {attempt}/{max_tries}): {str(data)[:300]}"
                     )
                     await asyncio.sleep(5 * attempt)
                     continue
 
+                # Filtrar solo pares USDT Perpetual activos
                 symbols = [
                     s["symbol"]
                     for s in data["symbols"]
                     if s.get("quoteAsset") == QUOTE_ASSET
                     and s.get("status") == "TRADING"
-                    and s.get("isSpotTradingAllowed", False)
+                    and s.get("contractType") == "PERPETUAL"
                 ]
-                log.info(f"Símbolos USDT activos en Binance: {len(symbols)}")
+                log.info(f"Símbolos USDT Perpetual activos en Binance Futures: {len(symbols)}")
                 return symbols
 
         except asyncio.TimeoutError:
@@ -614,7 +612,7 @@ async def get_klines_multi(session: aiohttp.ClientSession, symbol: str) -> list:
     start_ms      = now_ms - (DAYS_BACK * 24 * 60 * 60 * 1000)
     all_klines    = []
     current_start = start_ms
-    url           = f"{BINANCE_REST}/api/v3/klines"
+    url           = f"{BINANCE_REST}/fapi/v1/klines"   # Futures klines
 
     while current_start < now_ms and len(all_klines) < total_needed:
         params = {
@@ -1116,7 +1114,7 @@ def build_dashboard() -> str:
 
   <p style="color:#484f58;margin-top:.6rem;font-size:.7rem">
     Estrategia: EMA{EMA_FAST}/{EMA_MID}/{EMA_SLOW} | Spread ≥{SPREAD_PCT}% |
-    Timeframe: 1m | Datos: {DAYS_BACK}d | Binance USDT Spot |
+    Timeframe: 1m | Datos: {DAYS_BACK}d | Binance USDT Futures Perpetual | RR 1:4 |
     Última actualización local: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}
   </p>
 
@@ -1156,9 +1154,8 @@ async def bot_loop():
             f"📅 Datos: <b>{DAYS_BACK} días</b> de velas de 1m\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"💰 Balance inicial: <b>{INITIAL_BALANCE:.2f} USDT</b>\n"
-            f"📦 Por operación: <b>{USDT_PER_TRADE:.2f} USDT</b>  "
-            f"<i>(≥5 USDT mínimo Binance)</i>\n"
-            f"🎯 Take Profit: <b>+{TP_PCT}%</b> | 🛑 Stop Loss: <b>-{SL_PCT}%</b>\n"
+            f"📦 Por operación: <b>{USDT_PER_TRADE:.2f} USDT</b>\n"
+            f"🎯 Take Profit: <b>+{TP_PCT}%</b> | 🛑 Stop Loss: <b>-{SL_PCT}%</b>  <i>(RR 1:4)</i>\n"
             f"📊 Máx posiciones: <b>{MAX_LONGS} LONG + {MAX_SHORTS} SHORT</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
             f"🟢 LONG:  EMA{EMA_FAST} y EMA{EMA_MID} bajo EMA{EMA_SLOW} "
@@ -1166,7 +1163,7 @@ async def bot_loop():
             f"🔴 SHORT: EMA{EMA_FAST} y EMA{EMA_MID} sobre EMA{EMA_SLOW} "
             f"+ EMA{EMA_FAST} cruza ↓ EMA{EMA_MID}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔍 Monitoreando todos los pares USDT de Binance Spot"
+            f"🔍 Monitoreando todos los pares USDT Perpetual de Binance Futures"
         )
 
         # Iniciar WebSocket de precios como tarea paralela
@@ -1225,8 +1222,8 @@ async def bot_loop():
 # ══════════════════════════════════════════════════════════
 async def main():
     log.info("╔══════════════════════════════════════════════════════╗")
-    log.info("║   EMA Strategy Bot + Paper Trading — Binance USDT    ║")
-    log.info(f"║   EMAs: {EMA_FAST}/{EMA_MID}/{EMA_SLOW} | TP:{TP_PCT}% SL:{SL_PCT}% | Balance: {INITIAL_BALANCE:.0f} USDT ║")
+    log.info("║   EMA Strategy Bot + Paper Trading — Binance Futures  ║")
+    log.info(f"║   EMAs: {EMA_FAST}/{EMA_MID}/{EMA_SLOW} | TP:{TP_PCT}% SL:{SL_PCT}% (RR 1:4) | {INITIAL_BALANCE:.0f} USDT ║")
     log.info(f"║   Máx: {MAX_LONGS}L + {MAX_SHORTS}S | Tamaño/trade: {USDT_PER_TRADE:.1f} USDT         ║")
     log.info("╚══════════════════════════════════════════════════════╝")
 
