@@ -168,11 +168,16 @@ class TradeManager:
     son síncronos (sin I/O) y seguros en contextos asyncio.
     """
 
+    # Umbral de drawdown global (en USDT) para cierre de emergencia
+    GLOBAL_SL_USDT = 6.5
+
     def __init__(self) -> None:
-        self.balance  = INITIAL_BALANCE
-        self.trades   : list[Trade] = []
-        self._counter = 0
-        self._lock    = asyncio.Lock()
+        self.balance             = INITIAL_BALANCE
+        self.cycle_start_balance = INITIAL_BALANCE   # Balance al inicio del ciclo actual
+        self.trades              : list[Trade] = []
+        self._counter            = 0
+        self._lock               = asyncio.Lock()
+        self._global_sl_lock     = asyncio.Lock()    # Evita doble disparo del cierre global
 
     # ── Propiedades de consulta ───────────────────────────────────────────────
 
@@ -254,7 +259,29 @@ class TradeManager:
             )
             return trade
 
-    # ── Cerrar operación ──────────────────────────────────────────────────────
+    # ── Cerrar operación (helper interno, sin lock) ───────────────────────────
+
+    def _apply_close(self, trade: Trade, close_price: float, reason: str) -> None:
+        """Aplica el cierre de un trade. Debe llamarse DENTRO del lock."""
+        trade.status      = reason
+        trade.close_price = close_price
+        trade.close_time  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+        if trade.direction == "LONG":
+            trade.pnl_usdt = (close_price - trade.entry_price) * trade.quantity
+        else:
+            trade.pnl_usdt = (trade.entry_price - close_price) * trade.quantity
+
+        trade.roi_pct = (trade.pnl_usdt / trade.usdt_size) * 100
+        self.balance  += trade.usdt_size + trade.pnl_usdt
+
+        log.info(
+            f"[TRADE #{trade.id}] CERRADO {reason} {trade.symbol} "
+            f"@ ${close_price:.8f} | PnL: {trade.pnl_usdt:+.4f} USDT "
+            f"({trade.roi_pct:+.2f}%)"
+        )
+
+    # ── Cerrar una operación individual ──────────────────────────────────────
 
     async def close_trade(
         self, trade: Trade, close_price: float, reason: str
@@ -262,25 +289,38 @@ class TradeManager:
         async with self._lock:
             if trade.status != "OPEN":
                 return False
-
-            trade.status      = reason
-            trade.close_price = close_price
-            trade.close_time  = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-            if trade.direction == "LONG":
-                trade.pnl_usdt = (close_price - trade.entry_price) * trade.quantity
-            else:
-                trade.pnl_usdt = (trade.entry_price - close_price) * trade.quantity
-
-            trade.roi_pct = (trade.pnl_usdt / trade.usdt_size) * 100
-            self.balance  += trade.usdt_size + trade.pnl_usdt
-
-            log.info(
-                f"[TRADE #{trade.id}] CERRADO {reason} {trade.symbol} "
-                f"@ ${close_price:.8f} | PnL: {trade.pnl_usdt:+.4f} USDT "
-                f"({trade.roi_pct:+.2f}%)"
-            )
+            self._apply_close(trade, close_price, reason)
             return True
+
+    # ── Cierre global por drawdown (-7 USDT sobre balance de ciclo) ──────────
+
+    async def close_all_trades_global(self) -> list[Trade]:
+        """
+        Cierra TODAS las posiciones abiertas a precio actual (cierre global SL).
+        Tras el cierre, resetea cycle_start_balance con el nuevo balance.
+        Retorna la lista de trades cerrados.
+        """
+        closed: list[Trade] = []
+        async with self._lock:
+            for trade in list(self.open_trades):
+                price = trade.current_price if trade.current_price > 0 else trade.entry_price
+                self._apply_close(trade, price, "GLOBAL_SL")
+                closed.append(trade)
+
+            # ── Inicio del nuevo ciclo ────────────────────────────────────────
+            self.cycle_start_balance = self.balance
+            log.warning(
+                f"[GLOBAL SL] {len(closed)} posiciones cerradas | "
+                f"Nuevo balance de ciclo: {self.balance:.2f} USDT"
+            )
+        return closed
+
+    # ── Drawdown actual vs inicio de ciclo ───────────────────────────────────
+
+    @property
+    def cycle_drawdown(self) -> float:
+        """Pérdida en USDT desde el inicio del ciclo actual (negativo = pérdida)."""
+        return self.equity - self.cycle_start_balance
 
     # ── Actualización de precio (síncrono) ────────────────────────────────────
 
@@ -495,6 +535,38 @@ def build_close_message(trade: Trade) -> str:
     )
 
 
+def build_global_sl_message(closed_trades: list, prev_cycle_balance: float) -> str:
+    """Mensaje Telegram cuando se dispara el cierre global por drawdown -7 USDT."""
+    total_pnl = sum(t.pnl_usdt for t in closed_trades)
+    n         = len(closed_trades)
+    new_bal   = trade_manager.balance
+    drawdown  = new_bal - prev_cycle_balance
+
+    detail_lines = "\n".join(
+        f"  #{t.id} {t.symbol} {t.direction}: "
+        f"<code>{t.pnl_usdt:+.4f} USDT ({t.roi_pct:+.2f}%)</code>"
+        for t in closed_trades[:15]
+    )
+    suffix = f"\n  <i>…y {n - 15} más</i>" if n > 15 else ""
+
+    return (
+        f"🚨 <b>CIERRE GLOBAL — DRAWDOWN -7 USDT</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚠️ El equity cayó más de <b>7 USDT</b> desde el inicio del ciclo.\n"
+        f"🔒 Se cerraron <b>{n} posiciones</b> al precio actual.\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 Balance inicio de ciclo: <code>{prev_cycle_balance:.2f} USDT</code>\n"
+        f"💼 Balance nuevo (ciclo):   <code>{new_bal:.2f} USDT</code>\n"
+        f"📉 Drawdown del ciclo:      <code>{drawdown:+.4f} USDT</code>\n"
+        f"📊 PnL total cerrado:       <code>{total_pnl:+.4f} USDT</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Operaciones cerradas:</b>\n"
+        f"{detail_lines}{suffix}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔄 <i>Nuevo ciclo iniciado. Balance base: {new_bal:.2f} USDT</i>"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  GESTIÓN DEL KLINEWEBSOCKETCACHE
 # ══════════════════════════════════════════════════════════════════════════════
@@ -645,6 +717,34 @@ async def ws_price_loop(session: aiohttp.ClientSession) -> None:
 
                             if sym and price > 0:
                                 trade_manager.update_price(sym, price)
+
+                                # ── Check drawdown global (-7 USDT del ciclo) ──────
+                                if (
+                                    trade_manager.open_trades
+                                    and trade_manager.cycle_drawdown
+                                        < -TradeManager.GLOBAL_SL_USDT
+                                ):
+                                    async with trade_manager._global_sl_lock:
+                                        # Re-verificar dentro del lock para evitar doble disparo
+                                        if (
+                                            trade_manager.open_trades
+                                            and trade_manager.cycle_drawdown
+                                                < -TradeManager.GLOBAL_SL_USDT
+                                        ):
+                                            prev_bal = trade_manager.cycle_start_balance
+                                            log.warning(
+                                                f"[GLOBAL SL] Equity: {trade_manager.equity:.2f} | "
+                                                f"Ciclo inicio: {prev_bal:.2f} | "
+                                                f"Drawdown: {trade_manager.cycle_drawdown:+.4f} USDT"
+                                            )
+                                            closed_trades = await trade_manager.close_all_trades_global()
+                                            if closed_trades:
+                                                await send_telegram(
+                                                    session,
+                                                    build_global_sl_message(closed_trades, prev_bal)
+                                                )
+                                    continue   # Saltar check TP/SL individual (ya están cerrados)
+                                # ── Check TP/SL individuales ────────────────────────
                                 for trade, reason in trade_manager.trades_to_close(sym, price):
                                     closed = await trade_manager.close_trade(trade, price, reason)
                                     if closed:
@@ -731,6 +831,8 @@ async def get_usdt_symbols(session: aiohttp.ClientSession) -> List[str]:
                     and s.get("status")       == "TRADING"
                     and s.get("contractType") == "PERPETUAL"
                 ]
+                # 🔥 LIMITAR A 300 SÍMBOLOS
+                symbols = symbols[:150]
                 log.info(f"Símbolos USDT Perpetual activos en Binance Futures: {len(symbols)}")
                 return symbols
 
@@ -927,6 +1029,15 @@ DASHBOARD_JS = r"""
       document.getElementById('rpnl_value').textContent     = (Number(d.realized_pnl)>=0?'+':'')+fmt4(d.realized_pnl)+' USDT';
       document.getElementById('upnl_value').textContent     = (Number(d.unrealized_pnl)>=0?'+':'')+fmt4(d.unrealized_pnl)+' USDT';
       document.getElementById('wr_value').textContent       = d.win_rate===null?'N/A':`${d.win_rate.toFixed(1)}% (${d.wins}✅/${d.losses}❌)`;
+      // Ciclo de drawdown
+      const dd = Number(d.cycle_drawdown || 0);
+      const ddEl = document.getElementById('cycle_dd_value');
+      if (ddEl) {
+        ddEl.textContent = (dd>=0?'+':'')+fmt4(dd)+' USDT';
+        ddEl.style.color = dd >= 0 ? '#3fb950' : (dd > -(d.global_sl_usdt||7)*0.5 ? '#d29922' : '#f85149');
+      }
+      if (document.getElementById('cycle_base_value'))
+        document.getElementById('cycle_base_value').textContent = fmt2(d.cycle_start_balance) + ' USDT';
       document.getElementById('open_count_value').textContent= `${d.open_trades.length} / ${d.settings.max_longs+d.settings.max_shorts}`;
       document.getElementById('long_count_value').textContent = `${d.open_longs}L`;
       document.getElementById('short_count_value').textContent= `${d.open_shorts}S`;
@@ -981,11 +1092,14 @@ def get_dashboard_state() -> dict:
         }
 
     return {
-        "balance"        : tm.balance,
-        "equity"         : tm.equity,
-        "realized_pnl"   : tm.total_realized_pnl,
-        "unrealized_pnl" : tm.unrealized_pnl,
-        "wins"           : wins,
+        "balance"             : tm.balance,
+        "equity"              : tm.equity,
+        "cycle_start_balance" : tm.cycle_start_balance,
+        "cycle_drawdown"      : tm.cycle_drawdown,
+        "global_sl_usdt"      : TradeManager.GLOBAL_SL_USDT,
+        "realized_pnl"        : tm.total_realized_pnl,
+        "unrealized_pnl"      : tm.unrealized_pnl,
+        "wins"                : wins,
         "losses"         : losses,
         "win_rate"       : (wins / total_cl * 100.0) if total_cl else None,
         "total_alerts"   : bot_status["total_alerts"],
@@ -1026,6 +1140,7 @@ def build_dashboard() -> str:
     eq_color   = "#3fb950" if equity >= INITIAL_BALANCE else "#f85149"
     rpnl_color = "#3fb950" if rpnl >= 0 else "#f85149"
     upnl_color = "#3fb950" if upnl >= 0 else "#f85149"
+    dd_color   = "#3fb950" if tm.cycle_drawdown >= 0 else ("#d29922" if tm.cycle_drawdown > -TradeManager.GLOBAL_SL_USDT * 0.5 else "#f85149")
     ws_syms    = ", ".join(sorted(tm.active_symbols)) if tm.active_symbols else "Ninguno"
 
     cache_line = "Iniciando..." if _cache is None else (
@@ -1092,6 +1207,12 @@ def build_dashboard() -> str:
       <div class="value warn">{USDT_PER_TRADE:.2f} USDT</div></div>
     <div class="card"><div class="label">Balance inicial</div>
       <div class="value">{INITIAL_BALANCE:.2f} USDT</div></div>
+    <div class="card"><div class="label">🔄 Base de ciclo</div>
+      <div class="value warn" id="cycle_base_value">{tm.cycle_start_balance:.2f} USDT</div></div>
+    <div class="card"><div class="label">📉 Drawdown ciclo</div>
+      <div class="value" id="cycle_dd_value" style="color:{dd_color}">{tm.cycle_drawdown:+.4f} USDT</div></div>
+    <div class="card"><div class="label">🚨 Límite global SL</div>
+      <div class="value err">-{TradeManager.GLOBAL_SL_USDT:.2f} USDT</div></div>
   </div>
 
   <!-- KlineWebSocketCache stats -->
@@ -1300,6 +1421,8 @@ async def bot_loop() -> None:
                 f"L:{len(trade_manager.open_longs)} S:{len(trade_manager.open_shorts)} | "
                 f"Balance: {trade_manager.balance:.2f} USDT | "
                 f"Equity: {trade_manager.equity:.2f} USDT | "
+                f"Ciclo base: {trade_manager.cycle_start_balance:.2f} | "
+                f"Drawdown ciclo: {trade_manager.cycle_drawdown:+.2f} USDT | "
                 f"{cache_info} | "
                 f"Próximo en {wait:.1f}s"
             )
